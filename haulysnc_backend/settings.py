@@ -93,16 +93,9 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# In production set CORS_ALLOWED_ORIGINS env var to your Vercel URL:
-# e.g. "https://haulsync.vercel.app,https://haulsync-git-main-you.vercel.app"
-_cors_env = os.environ.get('CORS_ALLOWED_ORIGINS', '')
-if _cors_env:
-    CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(',') if o.strip()]
-    CORS_ALLOW_ALL_ORIGINS = False
-else:
-    # Development fallback
-    CORS_ALLOW_ALL_ORIGINS = True
-
+# Allow all origins — suitable for demo/assessment deployment.
+# Restrict to specific origins in a future production hardening step.
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
 # ── DRF ───────────────────────────────────────────────────────────────────────
