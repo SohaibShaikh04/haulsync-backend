@@ -1,9 +1,57 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+import requests as http_requests
 
 from .serializers import TripPlanRequestSerializer
 from .services.trip_planner import TripPlanner
+
+
+class GeocodeView(APIView):
+    """
+    GET /api/geocode/?q=Dallas, TX
+
+    Server-side proxy for Nominatim geocoding.
+    Avoids CORS issues when calling OpenStreetMap from the browser.
+    Returns: { lat, lng, name }
+    """
+
+    def get(self, request, *args, **kwargs):
+        query = request.query_params.get('q', '').strip()
+        if not query:
+            return Response(
+                {"error": "Missing query parameter 'q'"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            resp = http_requests.get(
+                'https://nominatim.openstreetmap.org/search',
+                params={'q': query, 'format': 'json', 'limit': 1},
+                headers={'User-Agent': 'HaulSync/1.0 (fleet-route-planner)'},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except Exception as e:
+            return Response(
+                {"error": "Geocoding service unavailable", "details": str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if not results:
+            return Response(
+                {"error": f"Location not found: {query}"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        place = results[0]
+        return Response({
+            "lat": float(place['lat']),
+            "lng": float(place['lon']),
+            "name": query,
+            "display_name": place.get('display_name', query),
+        }, status=status.HTTP_200_OK)
 
 
 class PlanTripView(APIView):
