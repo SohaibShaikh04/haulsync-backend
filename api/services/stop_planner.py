@@ -3,6 +3,12 @@ stop_planner.py
 
 Merges HOS-driven events with fuel stops and assigns geographic coordinates
 to every stop by interpolating along the route polyline.
+
+Assumptions (per FMCSA assessment spec):
+  - Property-carrying driver, 70 hrs/8-day cycle
+  - Fueling at least once every 1,000 miles
+  - 1 hour for pickup and drop-off each
+  - No adverse driving conditions
 """
 from .hos_engine import HOSEngine
 from .fuel_planner import FuelPlanner
@@ -10,6 +16,8 @@ from .routing_service import RoutingService
 
 
 class StopPlanner:
+    # Used only for converting drive segment hours → mile markers
+    # Primary drive time comes from OSRM (passed in as osrm_drive_hours)
     AVG_SPEED_MPH = 55.0
 
     def __init__(self):
@@ -24,6 +32,7 @@ class StopPlanner:
         pickup_coords: dict,
         dropoff_coords: dict,
         current_coords: dict,
+        osrm_drive_hours: float = None,
     ) -> list:
         """
         Produces a flat, time-ordered list of stop/event objects.
@@ -39,13 +48,23 @@ class StopPlanner:
         }
         """
         total_miles = route_data["distance_miles"]
-        total_drive_hours = total_miles / self.AVG_SPEED_MPH
         coordinates = route_data["coordinates"]
+
+        # Use OSRM's actual drive time for HOS planning if available
+        # Fall back to distance/speed only if OSRM didn't return a duration
+        if osrm_drive_hours and osrm_drive_hours > 0:
+            total_drive_hours = osrm_drive_hours
+        else:
+            total_drive_hours = total_miles / self.AVG_SPEED_MPH
+
+        # Effective speed derived from OSRM (miles per drive-hour)
+        # Used to convert HOS drive segments (hours) → mile markers
+        effective_mph = total_miles / total_drive_hours if total_drive_hours > 0 else self.AVG_SPEED_MPH
 
         # 1. Get HOS driving segment plan
         hos_events = self.hos.plan_driving_segments(total_drive_hours, cycle_used_hours)
 
-        # 2. Get fuel stop mile markers
+        # 2. Get fuel stop mile markers (every 1,000 miles per spec)
         fuel_mile_markers = set(self.fuel.plan_fuel_stops(total_miles))
 
         # 3. Build final event list by walking through HOS events and injecting fuel stops
@@ -63,13 +82,13 @@ class StopPlanner:
             "elapsed_hours": 0,
         })
 
-        # Pickup (first stop)
+        # Drive current → pickup
         pickup_mile = route_data["legs"][0]["distance_miles"]
-        pickup_drive_hours = pickup_mile / self.AVG_SPEED_MPH
+        pickup_drive_hours = pickup_mile / effective_mph
         final_events.append({
             "type": "pickup",
             "label": "Pickup",
-            "duration_hours": 1.0,  # 1hr for loading
+            "duration_hours": 1.0,   # 1 hr per spec
             "mile_marker": round(pickup_mile, 2),
             "coordinates": pickup_coords,
             "elapsed_hours": round(pickup_drive_hours, 2),
@@ -80,14 +99,13 @@ class StopPlanner:
         # Walk through HOS events
         for event in hos_events:
             if event["type"] == "drive":
-                seg_miles = event["duration_hours"] * self.AVG_SPEED_MPH
+                seg_miles = event["duration_hours"] * effective_mph
                 next_mile = miles_driven + seg_miles
 
                 # Check if any fuel stops fall in this drive segment
                 for fuel_mile in sorted(fuel_mile_markers):
                     if miles_driven < fuel_mile <= next_mile:
-                        # Insert fuel stop
-                        drive_to_fuel_hours = (fuel_mile - miles_driven) / self.AVG_SPEED_MPH
+                        drive_to_fuel_hours = (fuel_mile - miles_driven) / effective_mph
                         fuel_coords = self.routing.interpolate_point_at_mile(coordinates, fuel_mile)
                         elapsed_hours += drive_to_fuel_hours
                         final_events.append({
@@ -127,7 +145,7 @@ class StopPlanner:
                     "elapsed_hours": round(elapsed_hours, 2),
                 })
 
-        # Final: Dropoff
+        # Final: Dropoff (1 hr per spec)
         final_events.append({
             "type": "dropoff",
             "label": "Dropoff",

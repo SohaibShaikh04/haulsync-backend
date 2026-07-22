@@ -9,7 +9,7 @@ Output format:
   {
     "day": 1,
     "date": "2024-01-15",
-    "total_miles": 550,
+    "total_miles_driving": 550,
     "grid": [
       {
         "status": "off_duty" | "sleeper" | "driving" | "on_duty",
@@ -25,7 +25,7 @@ Output format:
       "driving": 11.0,
       "on_duty": 6.0
     },
-    "remarks": "Dallas, TX to Amarillo, TX"
+    "remarks": "Day 1 of trip"
   }
 ]
 """
@@ -53,19 +53,30 @@ STATUS_LABELS = {
 
 
 class ELDGenerator:
-    def generate(self, timeline: list, departure_iso: str = None) -> list:
+    def generate(
+        self,
+        timeline: list,
+        departure_iso: str = None,
+        total_miles: float = 0.0,
+        total_drive_hours: float = 0.0,
+    ) -> list:
         """
         Converts a timeline into paginated daily log pages.
+
+        total_miles + total_drive_hours are used to accurately
+        prorate each day's mileage from actual OSRM route distance.
         """
         if not timeline:
             return []
 
-        # Use departure time from first event
         departure_time = datetime.fromisoformat(timeline[0]["absolute_time"].replace("Z", ""))
         day_start = departure_time.replace(hour=0, minute=0, second=0, microsecond=0)
 
         # Bucket events by calendar day
-        days = {}  # day_index -> list of (status, start_hours_into_day, end_hours_into_day)
+        days = {}  # day_index -> list of segments + drive hour accumulator
+
+        # Track total driving hours across all days to prorate miles accurately
+        day_drive_hours = {}  # day_idx -> accumulated driving hours
 
         for event in timeline:
             abs_time = datetime.fromisoformat(event["absolute_time"].replace("Z", ""))
@@ -81,7 +92,6 @@ class ELDGenerator:
             # Events can span multiple days — split them
             current_pos = event_start
             while current_pos < event_end:
-                # Determine which day
                 day_idx = (current_pos - day_start).days
                 this_day_start = day_start + timedelta(days=day_idx)
                 this_day_end = this_day_start + timedelta(hours=24)
@@ -89,13 +99,14 @@ class ELDGenerator:
                 seg_end = min(event_end, this_day_end)
                 seg_start_h = (current_pos - this_day_start).total_seconds() / 3600
                 seg_end_h = (seg_end - this_day_start).total_seconds() / 3600
+                seg_hours = (seg_end - current_pos).total_seconds() / 3600
 
                 if day_idx not in days:
                     days[day_idx] = {
                         "date": this_day_start.strftime("%Y-%m-%d"),
                         "segments": [],
-                        "miles": 0.0,
                     }
+                    day_drive_hours[day_idx] = 0.0
 
                 days[day_idx]["segments"].append({
                     "status": status,
@@ -104,9 +115,9 @@ class ELDGenerator:
                     "label": STATUS_LABELS.get(status, status),
                 })
 
+                # Accumulate driving hours per day for mileage proration
                 if event["type"] == "drive":
-                    seg_hours = (seg_end - current_pos).total_seconds() / 3600
-                    days[day_idx]["miles"] += round(seg_hours * 55.0, 2)
+                    day_drive_hours[day_idx] += seg_hours
 
                 current_pos = seg_end
 
@@ -116,19 +127,25 @@ class ELDGenerator:
             day_data = days[day_idx]
             segments = day_data["segments"]
 
-            # Fill gaps with off_duty
             filled_segments = self._fill_gaps(segments)
 
-            totals = {"off_duty": 0, "sleeper": 0, "driving": 0, "on_duty": 0}
+            totals = {"off_duty": 0.0, "sleeper": 0.0, "driving": 0.0, "on_duty": 0.0}
             for seg in filled_segments:
                 key = seg["status"]
                 if key in totals:
-                    totals[key] += round(seg["end_hour"] - seg["start_hour"], 4)
+                    totals[key] += seg["end_hour"] - seg["start_hour"]
+
+            # Prorate miles: this day's driving hours / total driving hours * total route miles
+            # This gives accurate mileage that sums to the OSRM total distance
+            if total_drive_hours > 0 and total_miles > 0:
+                day_miles = round((day_drive_hours.get(day_idx, 0.0) / total_drive_hours) * total_miles, 1)
+            else:
+                day_miles = round(totals["driving"] * 55.0, 1)
 
             log_pages.append({
                 "day": day_idx + 1,
                 "date": day_data["date"],
-                "total_miles_driving": round(day_data["miles"], 1),
+                "total_miles_driving": day_miles,
                 "grid": filled_segments,
                 "totals": {k: round(v, 2) for k, v in totals.items()},
             })
@@ -140,11 +157,9 @@ class ELDGenerator:
         if not segments:
             return [{"status": "off_duty", "start_hour": 0, "end_hour": 24, "label": "Off Duty"}]
 
-        # Sort segments
         segments = sorted(segments, key=lambda s: s["start_hour"])
         filled = []
 
-        # Gap before first segment
         if segments[0]["start_hour"] > 0:
             filled.append({
                 "status": "off_duty",
@@ -154,7 +169,6 @@ class ELDGenerator:
             })
 
         for seg in segments:
-            # Fill gap between previous end and this start
             if filled and filled[-1]["end_hour"] < seg["start_hour"]:
                 filled.append({
                     "status": "off_duty",
@@ -164,7 +178,6 @@ class ELDGenerator:
                 })
             filled.append(seg)
 
-        # Gap after last segment
         if filled and filled[-1]["end_hour"] < 24:
             filled.append({
                 "status": "off_duty",
